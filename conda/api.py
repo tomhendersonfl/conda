@@ -26,8 +26,8 @@ def _fn2fullspec(fn):
 
 
 def get_index(channel_urls=(), prepend=True, platform=None,
-              use_cache=False, unknown=False, offline=False,
-              prefix=None):
+              use_local=False, use_cache=False, unknown=False,
+              offline=False, prefix=None):
     """
     Return the index of packages available on the channels
 
@@ -35,6 +35,8 @@ def get_index(channel_urls=(), prepend=True, platform=None,
     If platform=None, then the current platform is used.
     If prefix is supplied, then the packages installed in that prefix are added.
     """
+    if use_local:
+        channel_urls = ['local'] + list(channel_urls)
     channel_urls = config.normalize_urls(channel_urls, platform, offline)
     if prepend:
         pri0 = max(itervalues(channel_urls), key=itemgetter(1))[1] if channel_urls else 0
