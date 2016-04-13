@@ -59,6 +59,7 @@ def get_index(channel_urls=(), prepend=True, platform=None,
                 info['url'] = channel + fn
                 info['priority'] = priority
                 index[key] = info
+            index[key]['is_linked'] = True
     return index
 
 
@@ -118,7 +119,7 @@ def app_info_packages(fn, prefix=config.root_dir):
     index = get_index(prefix=prefix)
     r = Resolve(index)
     res = []
-    for fn2 in r.solve([_fn2fullspec(fn)], installed=install.linked(prefix)):
+    for fn2 in r.solve([_fn2fullspec(fn)], installed=r.installed):
         info = index[fn2]
         if 'link' not in info:
             res.append((info['name'], info['version'], info['size'],
