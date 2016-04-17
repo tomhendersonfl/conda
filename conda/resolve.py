@@ -270,7 +270,7 @@ class Resolve(object):
             groups.setdefault(info['name'], []).append(fkey)
             for feat in info.get('track_features', '').split():
                 trackers.setdefault(feat, []).append(fkey)
-            if info.get('is_linked'):
+            if 'link' in info:
                 installed.add(fkey)
 
         self.index = index

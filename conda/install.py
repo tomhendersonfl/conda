@@ -77,6 +77,14 @@ except ImportError:
             return root_prefix + "/" + found
         return re.sub(path_re, translation, path).replace(";/", ":/")
 
+# Make sure the script stays standalone for the installer
+try:
+    from conda.config import remove_binstar_tokens
+except ImportError:
+    # There won't be any binstar tokens in the installer anyway
+    def remove_binstar_tokens(url):
+        return url
+
 on_win = bool(sys.platform == "win32")
 
 if on_win:
@@ -376,8 +384,9 @@ def create_meta(prefix, dist, info_dir, extra_info):
     # read info/index.json first
     with open(join(info_dir, 'index.json')) as fi:
         meta = json.load(fi)
-    # add extra info
+    # add extra info, add to our intenral cache
     meta.update(extra_info)
+    load_linked_data(prefix, dist, meta)
     # write into <env>/conda-meta/<dist>.json
     meta_dir = join(prefix, 'conda-meta')
     if not isdir(meta_dir):
@@ -449,7 +458,14 @@ def run_script(prefix, dist, action='post-link', env_prefix=None):
         return False
     return True
 
-package_table = {}
+# The current package cache does not support the ability to store multiple packages
+# with the same filename from different channels. Furthermore, the filename itself
+# cannot be used to disambiguate; we must read the URL from urls.txt to determine
+# the source channel. For this reason, we now fully parse the directory and its
+# accompanying urls.txt file so we can make arbitrary queries without having to
+# read this data multiple times.
+
+package_cache_ = {}
 fname_table = {}
 def add_cached_package(pdir, url, overwrite=False, urlstxt=False):
     package_cache()
@@ -471,16 +487,16 @@ def add_cached_package(pdir, url, overwrite=False, urlstxt=False):
         xdir = None
     if not (xpkg or xdir):
         return
-    channel, prefix = url_channel(url)
+    url = remove_binstar_tokens(url)
+    channel, schannel = url_channel(url)
+    prefix = '' if schannel == 'defaults' else schannel + '::'
     fname_table[xpkg] = prefix
     fkey = prefix + dist
-    rec = package_table.get(fkey)
+    rec = package_cache_.get(fkey)
     if rec is None:
-        rec = package_table[fkey] = dict(files=[], dirs=[], urls=[])
-    if channel != 'unknown':
-        url = channel + '/' + fname
-        if url not in rec['urls']:
-            rec['urls'].append(url)
+        rec = package_cache_[fkey] = dict(files=[], dirs=[], urls=[])
+    if url not in rec['urls']:
+        rec['urls'].append(url)
     if xpkg not in rec['files']:
         rec['files'].append(xpkg)
     if xdir and xdir not in rec['dirs']:
@@ -493,9 +509,10 @@ def add_cached_package(pdir, url, overwrite=False, urlstxt=False):
             pass
 
 def package_cache():
-    if '@' in package_table:
-        return package_table
-    package_table['@'] = dict(files=[], dirs=[], urls=[])
+    if package_cache_:
+        return package_cache_
+    # Stops recursion
+    package_cache_['@'] = None
     for pdir in config.pkgs_dirs:
         try:
             data = open(join(pdir, 'urls.txt')).read()
@@ -506,9 +523,10 @@ def package_cache():
                 add_cached_package(pdir, 'unknown/' + fn)
         except IOError:
             continue
-    return package_table
+    del package_cache_['@']
+    return package_cache_
 
-def read_url(pkgs_dir, dist):
+def read_url(dist):
     return package_cache().get(dist, {}).get('urls', (None,))[0]
 
 def read_icondata(source_dir):
@@ -590,7 +608,6 @@ def fetched():
 def is_fetched(dist):
     for fn in package_cache().get(dist, {}).get('files', ()):
         return fn
-    return None
 
 def rm_fetched(dist):
     rec = package_cache().get(dist)
@@ -603,7 +620,7 @@ def rm_fetched(dist):
     for fname in rec['dirs']:
         with Locked(dirname(fname)):
             rm_rf(fname)
-    del package_table[dist]
+    del package_cache_[dist]
 
 # ------- package cache ----- extracted
 
@@ -618,7 +635,7 @@ def extract(dist):
     Extract a package, i.e. make a package available for linkage.  We assume
     that the compressed packages is located in the packages directory.
     """
-    rec = package_table[dist]
+    rec = package_cache_[dist]
     fname = rec['files'][0]
     pkgs_dir = dirname(fname)
     with Locked(pkgs_dir):
@@ -642,7 +659,6 @@ def extract(dist):
 def is_extracted(dist):
     for fn in package_cache().get(dist, {}).get('dirs', ()):
         return fn
-    return None
 
 def rm_extracted(dist):
     rec = package_cache().get(dist)
@@ -668,51 +684,82 @@ def find_new_location(dist):
             if p or prefix is None:
                 return pkg_path, prefix + dname if p else None
 
-# ------- linkage of packages
+# Because the conda-meta .json files do not include channel names in
+# their filenames, we have to pull that information from the .json
+# files themselves. This has made it necessary in virtually all
+# circumstances to load the full set of files from this directory.
+# Therefore, we have implemented a full internal cache of this
+# data to eliminate redundant file reads.
 
-def meta_(prefix, dist):
+linked_data_ = {}
+
+
+def load_linked_data(prefix, dist, rec=None):
+    schannel, dname = _dist2pair(dist)
+    if rec is None:
+        meta_file = join(prefix, 'conda-meta', dname + '.json')
+        try:
+            with open(meta_file) as fi:
+                rec = json.load(fi)
+        except IOError:
+            return None
+        _, schannel = url_channel(rec.get('url'))
+    else:
+        linked_data(prefix)
+    rec['schannel'] = schannel
+    cprefix = '' if schannel == 'defaults' else schannel + '::'
+    rec['fn'] = dname + '.tar.bz2'
+    linked_data_[prefix][str(cprefix + dname)] = rec
+    return rec
+
+
+def delete_linked_data(prefix, dist, delete=True):
+    recs = linked_data_.get(prefix)
+    if recs and dist in recs:
+        del recs[dist]
+    if delete:
+        meta_path = join(prefix, 'conda-meta', _dist2filename(dist, '.json'))
+        if isfile(meta_path):
+            os.unlink(meta_path)
+
+
+def load_meta(prefix, dist):
     """
     Return the install meta-data for a linked package in a prefix, or None
     if the package is not linked in the prefix.
     """
-    try:
-        meta_file = join(prefix, 'conda-meta', dist + '.json')
-        with open(meta_file) as fi:
-            rec = json.load(fi)
-        rec['channel'], rec['schannel'], prefix = url_channel(rec['url'])
-        rec['fn'] = prefix + dist + '.tar.bz2'
-        return rec
-    except IOError:
-        return None
+    return linked_data(prefix).get(dist)
+
 
 def linked_data(prefix):
     """
     Return a dictionary of the linked packages in prefix.
     """
-    res = {}
-    meta_dir = join(prefix, 'conda-meta')
-    if isdir(meta_dir):
-        for fn in os.listdir(meta_dir):
-            rec = meta_(prefix, fn[:-5])
-            if rec:
-                res[rec['fn'][:-8]] = rec
-    return res
+    # Manually memoized so it can be updated
+    recs = linked_data_.get(prefix)
+    if recs is None:
+        recs = linked_data_[prefix] = {}
+        meta_dir = join(prefix, 'conda-meta')
+        if isdir(meta_dir):
+            for fn in os.listdir(meta_dir):
+                if fn.endswith('.json'):
+                    load_linked_data(prefix, fn[:-5])
+    return recs
+
 
 def linked(prefix):
     """
-    Return the (set of canonical names) of linked packages in prefix.
+    Return the set of canonical names of linked packages in prefix.
     """
-    return set(fkey for fkey in iterkeys(linked_data(prefix)))
+    return set(iterkeys(linked_data(prefix)))
 
 # FIXME Functions that begin with `is_` should return True/False
 def is_linked(prefix, dist):
     """
-    Return the install meta-data for a linked package in a prefix, or None
+    Return the install metadata for a linked package in a prefix, or None
     if the package is not linked in the prefix.
     """
-    schannel, dist = _dist2pair(dist)
-    rec = meta_(prefix, dist)
-    return rec if rec and rec['schannel'] == schannel else None
+    return load_meta(prefix, dist)
 
 def delete_trash(prefix=None):
     from conda import config
@@ -772,10 +819,6 @@ def move_path_to_trash(path):
 
     log.debug("Could not move %s to trash" % path)
     return False
-
-# FIXME This should contain the implementation that loads meta, not is_linked()
-def load_meta(prefix, dist):
-    return is_linked(prefix, dist)
 
 def link(prefix, dist, linktype=LINK_HARD, index=None):
     '''
@@ -842,28 +885,16 @@ def link(prefix, dist, linktype=LINK_HARD, index=None):
         if not run_script(prefix, dist, 'post-link'):
             sys.exit("Error: post-link failed for: %s" % dist)
 
-        # Make sure the script stays standalone for the installer
-        try:
-            from conda.config import remove_binstar_tokens
-        except ImportError:
-            # There won't be any binstar tokens in the installer anyway
-            def remove_binstar_tokens(url):
-                return url
-
         meta_dict = index.get(dist + '.tar.bz2', {})
-        meta_dict['url'] = read_url(pkgs_dir, dist)
-        if meta_dict['url']:
-            meta_dict['url'] = remove_binstar_tokens(meta_dict['url'])
+        meta_dict['url'] = read_url(dist)
         try:
-            alt_files_path = join(prefix, 'conda-meta', dist + '.files')
+            alt_files_path = join(prefix, 'conda-meta', _dist2filename(dist, '.files'))
             meta_dict['files'] = list(yield_lines(alt_files_path))
             os.unlink(alt_files_path)
         except IOError:
             meta_dict['files'] = files
         meta_dict['link'] = {'source': source_dir,
                              'type': link_name_map.get(linktype)}
-        if 'channel' in meta_dict:
-            meta_dict['channel'] = remove_binstar_tokens(meta_dict['channel'])
         if 'icon' in meta_dict:
             meta_dict['icondata'] = read_icondata(source_dir)
 
@@ -875,14 +906,10 @@ def unlink(prefix, dist):
     Remove a package from the specified environment, it is an error if the
     package does not exist in the prefix.
     '''
-    dist = _dist2filename(dist, '')
     with Locked(prefix):
         run_script(prefix, dist, 'pre-unlink')
 
-        meta_path = join(prefix, 'conda-meta', dist + '.json')
-        with open(meta_path) as fi:
-            meta = json.load(fi)
-
+        meta = load_meta(prefix, dist)
         mk_menus(prefix, meta['files'], remove=True)
         dst_dirs1 = set()
 
@@ -903,7 +930,7 @@ def unlink(prefix, dist):
                         log.debug("cannot import conda.config; probably not an issue")
 
         # remove the meta-file last
-        os.unlink(meta_path)
+        delete_linked_data(prefix, dist, delete=True)
 
         dst_dirs2 = set()
         for path in dst_dirs1:
@@ -929,7 +956,7 @@ def messages(prefix):
         rm_rf(path)
 
 
-def duplicates_to_remove(linked_dists, keep_dists):
+def duplicates_to_remove(dist_metas, keep_dists):
     """
     Returns the (sorted) list of distributions to be removed, such that
     only one distribution (for each name) remains.  `keep_dists` is an
@@ -939,7 +966,7 @@ def duplicates_to_remove(linked_dists, keep_dists):
 
     keep_dists = set(keep_dists)
     ldists = defaultdict(set)  # map names to set of distributions
-    for dist in linked_dists:
+    for dist in dist_metas:
         name = name_dist(dist)
         ldists[name].add(dist)
 
